@@ -66,6 +66,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/digests/{id}` | 按 id 查询保存的完整酶切结果（不存在返回 404） |
 | `POST` | `/digests/{id}/variant-analysis` | 对已保存记录施加一组单碱基替换并重跑酶切，返回切口与片段长度差异（不落库，记录不存在返回 404） |
 | `POST` | `/digests/{id}/enzyme-panel-plan` | 枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读不落库，记录不存在返回 404，无解返回 422） |
+| `POST` | `/digests/{id}/partial-digest-distribution` | 为每个已保存物理切口指定独立切割概率，枚举成功/失败状态并返回片段长度多重集的概率分布（只读不落库，记录不存在返回 404） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -257,6 +258,76 @@ curl -X POST http://localhost:8000/digests/1/enzyme-panel-plan \
 | `candidates` 为空或超过 8 种 | **422** |
 | 候选酶非法（非 IUPAC 模式 / 切口偏移越界） | **422** |
 
+## 部分酶切概率分布
+
+对一次**已保存的完整酶切结果**，为其中每个**物理切口**指定一个 0～1 的**独立
+切割概率**（partial digest：该切口以给定概率切成功，否则保持未切）。服务枚举
+全部成功/失败状态（**至多 12 个切口，最多 4096 种状态**），复用线性/环形片段
+重建逻辑生成产物，把**片段长度多重集相同**的状态合并并累加概率，按概率**降序
+稳定返回**。**分析过程不写库**：原记录保持不变，也不会产生新的提交。
+
+### 请求
+
+```bash
+curl -X POST http://localhost:8000/digests/1/partial-digest-distribution \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "cuts": [
+      {"top_cut": 5, "bottom_cut": 9, "probability": 0.8}
+    ]
+  }'
+```
+
+- `cuts`：每个**已保存物理切口**恰好一项（坐标身份为 `(top_cut, bottom_cut)`，
+  与 `GET /digests/{id}` 结果一致）：
+  - `probability`：该切口独立切成功的概率，闭区间 **`[0, 1]`**；`0` 表示必不切、
+    `1` 表示必切，`NaN` / 无穷大 / 越界均为 **422**；
+  - 请求条目的顺序不影响结果（按已保存切口 `(top_cut, bottom_cut)` 升序枚举）。
+- 记录本身没有切口时，允许传空列表 `[]`，得到概率为 1 的唯一全长结果。
+
+### 响应
+
+以上例（记录序列 `AAAAGAATTCTTTT`，EcoRI 单切口 `(5,9)`）为例：
+
+```json
+{
+  "id": 1,
+  "topology": "linear",
+  "sequence_length": 14,
+  "cut_count": 1,
+  "outcome_count": 2,
+  "total_probability": 1.0,
+  "outcomes": [
+    {"fragment_lengths": [5, 9], "fragment_count": 2, "probability": 0.8},
+    {"fragment_lengths": [14], "fragment_count": 1, "probability": 0.2}
+  ]
+}
+```
+
+- `outcomes[]`：
+  - `fragment_lengths`：**排序后的片段长度多重集**——不同切割状态只要产物长度
+    分布相同（如在线性分子上只切对称位置切口之一）就合并为一项；
+  - `fragment_count`：片段数（= 长度多重集大小）；
+  - `probability`：该长度分布的合并概率。
+- `total_probability`：所有返回结果概率之和（独立事件全枚举，数学上恒为 1），
+  服务以 `math.fsum` 精确累加，**与 1 的误差远小于 1e-9**。
+- **稳定排序**：先按 `probability` 降序；概率相同的按长度多重集字典序排序，
+  相同请求（无论 `cuts` 条目顺序）结果必然一致。概率为 0 的不可能结果不返回。
+- **拓扑规则与完整酶切完全一致**：线性分子的端点切口不产生新边界；环形分子
+  单切口开环为 1 条全长片段、无切口保留整条环（因此环形分子的"无切口"与
+  "恰好一个切口成功"会合并到同一长度多重集 `[L]`）。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 记录不存在 | **404** |
+| 请求缺少某个已保存切口的概率 | **422** |
+| 请求给出了已保存结果中不存在的切口坐标 | **422** |
+| 请求内同一坐标重复出现 | **422** |
+| 概率不在 `[0, 1]`（含 `NaN` / 无穷大） | **422** |
+| 已保存切口数超过 12（枚举上限 4096 状态） | **422** |
+
 ## 结果字段约定
 
 - **坐标**：均为 0-based，作用于 top 链（提交序列方向）；切口位置 `c` 表示断裂
@@ -295,6 +366,7 @@ app/
 ├── digest.py    # 酶切核心算法（搜索、去重、片段生成）
 ├── variant.py   # 变异施加与切口/片段差异对比
 ├── panel.py     # 酶组合面板规划（枚举候选组合、最少酶择优）
+├── distribution.py  # 部分酶切概率分布（枚举成功/失败状态、长度多重集合并）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -302,7 +374,8 @@ tests/
 ├── test_digest.py       # 酶切算法测试
 ├── test_api.py          # 提交/查询/校验 API 测试
 ├── test_variant_api.py  # 变异影响分析 API 测试
-└── test_panel_api.py    # 酶组合面板规划 API 测试
+├── test_panel_api.py    # 酶组合面板规划 API 测试
+└── test_distribution_api.py  # 部分酶切概率分布 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt

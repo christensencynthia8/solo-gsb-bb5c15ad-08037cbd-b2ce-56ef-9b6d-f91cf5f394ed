@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -245,4 +246,73 @@ class EnzymePanelPlanResponse(BaseModel):
     selected_enzymes: list[EnzymeIn]
     fragment_count: int
     cuts: list[CutOut]
+
+
+# ---------- 部分酶切概率分布 ----------
+
+
+class CutProbabilityIn(BaseModel):
+    """一个已保存物理切口 (top_cut, bottom_cut) 的独立切割概率。
+
+    坐标身份与完整酶切结果一致；概率取闭区间 [0, 1]（0 表示必不切、
+    1 表示必切），NaN/无穷大非法。坐标与已保存切口是否一一匹配
+    （缺失/多余）依赖记录内容，在路由取到记录后校验 -> 422。
+    """
+
+    top_cut: int = Field(examples=[5])
+    bottom_cut: int = Field(examples=[9])
+    probability: float = Field(ge=0.0, le=1.0, examples=[0.8])
+
+    @field_validator("probability")
+    @classmethod
+    def _probability_finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("probability must be a finite number")
+        return v
+
+
+class PartialDigestRequest(BaseModel):
+    """部分酶切概率分布请求：为每个已保存物理切口指定独立切割概率。
+
+    请求内同一物理坐标重复出现即 422 拒绝；允许空列表（记录本身
+    无切口时，唯一的结果是整条分子不被切割）。
+    """
+
+    cuts: list[CutProbabilityIn] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _no_duplicate_coordinates(self) -> "PartialDigestRequest":
+        seen: set[tuple[int, int]] = set()
+        duplicates: set[tuple[int, int]] = set()
+        for item in self.cuts:
+            key = (item.top_cut, item.bottom_cut)
+            if key in seen:
+                duplicates.add(key)
+            seen.add(key)
+        if duplicates:
+            raise ValueError(
+                "duplicate cut coordinates: "
+                + ", ".join(f"({t}, {b})" for t, b in sorted(duplicates))
+            )
+        return self
+
+
+class PartialDigestOutcome(BaseModel):
+    """一种片段长度多重集结果及其合并后的发生概率。"""
+
+    fragment_lengths: list[int]
+    fragment_count: int
+    probability: float
+
+
+class PartialDigestDistributionResponse(BaseModel):
+    """部分酶切分布：合并后的结果按概率降序稳定排列。"""
+
+    id: int
+    topology: Literal["linear", "circular"]
+    sequence_length: int
+    cut_count: int
+    outcome_count: int
+    total_probability: float
+    outcomes: list[PartialDigestOutcome]
 
