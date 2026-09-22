@@ -1,0 +1,248 @@
+"""请求/响应模型与输入校验。
+
+所有校验在数据库写入之前完成：任何一个酶的偏移非法都会使
+整个请求以 422 被拒绝，不会有任何数据落库。
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .iupac import VALID_BASES
+
+
+def _check_iupac(value: str, what: str) -> str:
+    seq = value.strip().upper()
+    if not seq:
+        raise ValueError(f"{what} must not be empty")
+    bad = sorted(set(seq) - VALID_BASES)
+    if bad:
+        raise ValueError(
+            f"{what} contains non-IUPAC bases: {''.join(bad)}; "
+            "allowed: ACGTRYSWKMBDHVN"
+        )
+    return seq
+
+
+class EnzymeIn(BaseModel):
+    """一种限制性内切酶：识别模式 + 正/反链切口偏移。
+
+    偏移以识别位点 5' 端（top 链坐标）为基准，合法范围为
+    [0, len(pattern)]；超出范围（含负数）即非法，整个请求被拒绝。
+    """
+
+    name: str = Field(min_length=1, max_length=100, examples=["EcoRI"])
+    pattern: str = Field(examples=["GAATTC"])
+    cut_top: int = Field(description="top 链切口偏移，0..len(pattern)", examples=[1])
+    cut_bottom: int = Field(description="bottom 链切口偏移，0..len(pattern)", examples=[5])
+
+    @field_validator("name")
+    @classmethod
+    def _name_ok(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("enzyme name must not be blank")
+        return v
+
+    @field_validator("pattern")
+    @classmethod
+    def _pattern_ok(cls, v: str) -> str:
+        return _check_iupac(v, "pattern")
+
+    @model_validator(mode="after")
+    def _offsets_ok(self) -> "EnzymeIn":
+        k = len(self.pattern)
+        for field_name in ("cut_top", "cut_bottom"):
+            value = getattr(self, field_name)
+            if not 0 <= value <= k:
+                raise ValueError(
+                    f"enzyme '{self.name}': {field_name}={value} is out of "
+                    f"range [0, {k}] for pattern '{self.pattern}'"
+                )
+        return self
+
+
+class DigestRequest(BaseModel):
+    sequence: str = Field(examples=["AAAAGAATTCTTTT"])
+    topology: Literal["linear", "circular"] = "linear"
+    enzymes: list[EnzymeIn] = Field(min_length=1)
+
+    @field_validator("sequence")
+    @classmethod
+    def _sequence_ok(cls, v: str) -> str:
+        return _check_iupac(v, "sequence")
+
+
+class VariantIn(BaseModel):
+    """一个 0-based 单碱基替换：将 position 处碱基替换为 alt。
+
+    position 上界依赖已保存记录的序列长度，因此越界检查在路由中
+    （取到记录之后）完成，以 422 拒绝；此处只做非负与碱基合法性校验。
+    """
+
+    position: int = Field(ge=0, examples=[4])
+    alt: str = Field(min_length=1, max_length=1, examples=["C"])
+
+    @field_validator("alt")
+    @classmethod
+    def _alt_ok(cls, v: str) -> str:
+        v = v.strip().upper()
+        if v not in VALID_BASES:
+            raise ValueError(
+                f"alt '{v}' is not an IUPAC base; allowed: ACGTRYSWKMBDHVN"
+            )
+        return v
+
+
+class VariantAnalysisRequest(BaseModel):
+    """变异影响分析请求：至少一个替换；同一位置重复出现即 422 拒绝。"""
+
+    variants: list[VariantIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _no_duplicate_positions(self) -> "VariantAnalysisRequest":
+        seen: set[int] = set()
+        duplicates: set[int] = set()
+        for v in self.variants:
+            if v.position in seen:
+                duplicates.add(v.position)
+            seen.add(v.position)
+        if duplicates:
+            raise ValueError(
+                "duplicate variant positions: "
+                + ", ".join(str(p) for p in sorted(duplicates))
+            )
+        return self
+
+
+
+class SiteOut(BaseModel):
+    enzyme: str
+    start: int
+    strand: Literal["+", "-"]
+    matched: str
+
+
+class CutOut(BaseModel):
+    top_cut: int
+    bottom_cut: int
+    end_type: Literal["blunt", "5prime", "3prime"]
+    overhang: str
+    enzymes: list[str]
+    sites: list[SiteOut]
+
+
+class EndOut(BaseModel):
+    type: Literal["blunt", "5prime", "3prime", "none"]
+    overhang: str
+
+
+class FragmentOut(BaseModel):
+    index: int
+    start: int
+    end: int
+    length: int
+    sequence: str
+    wraps_origin: bool
+    left_end: EndOut
+    right_end: EndOut
+
+
+class DigestResult(BaseModel):
+    cuts: list[CutOut]
+    fragments: list[FragmentOut]
+
+
+class DigestResponse(DigestResult):
+    id: int
+    topology: Literal["linear", "circular"]
+    sequence: str
+    sequence_length: int
+    enzymes: list[EnzymeIn]
+    created_at: str
+
+
+class DigestSummary(BaseModel):
+    id: int
+    topology: str
+    sequence_length: int
+    enzyme_count: int
+    cut_count: int
+    fragment_count: int
+    created_at: str
+
+
+# ---------- 变异影响分析 ----------
+
+
+class AppliedVariantOut(BaseModel):
+    position: int
+    ref: str
+    alt: str
+
+
+class ChangedCutOut(BaseModel):
+    """坐标相同、但末端或归属酶/位点发生变化的切口。"""
+
+    before: CutOut
+    after: CutOut
+    changes: list[str]
+
+
+class CutDiffOut(BaseModel):
+    added: list[CutOut]
+    removed: list[CutOut]
+    changed: list[ChangedCutOut]
+
+
+class ChangedFragmentOut(BaseModel):
+    start: int
+    before_length: int
+    after_length: int
+    length_delta: int
+
+
+class FragmentDiffOut(BaseModel):
+    """片段长度差异：before/after_lengths 为物理顺序的片段长度清单。"""
+
+    before_lengths: list[int]
+    after_lengths: list[int]
+    added: list[FragmentOut]
+    removed: list[FragmentOut]
+    changed: list[ChangedFragmentOut]
+
+
+class VariantAnalysisResponse(BaseModel):
+    id: int
+    sequence_length: int
+    variant_sequence: str
+    variants: list[AppliedVariantOut]
+    cuts: CutDiffOut
+    fragments: FragmentDiffOut
+
+
+# ---------- 酶组合面板规划 ----------
+
+
+class EnzymePanelPlanRequest(BaseModel):
+    """酶组合面板规划请求：目标片段数 + 1~8 种候选酶。
+
+    候选酶沿用 EnzymeIn 的全部校验（IUPAC 模式、切口偏移范围），
+    任一候选非法即整个请求以 422 拒绝。
+    """
+
+    target_fragment_count: int = Field(ge=1, examples=[3])
+    candidates: list[EnzymeIn] = Field(min_length=1, max_length=8)
+
+
+class EnzymePanelPlanResponse(BaseModel):
+    """规划结果：选中的最少酶集合、其切口与达到的片段数（恒等于目标值）。"""
+
+    id: int
+    target_fragment_count: int
+    selected_enzymes: list[EnzymeIn]
+    fragment_count: int
+    cuts: list[CutOut]
+
