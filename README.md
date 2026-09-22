@@ -66,6 +66,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/digests/{id}` | 按 id 查询保存的完整酶切结果（不存在返回 404） |
 | `POST` | `/digests/{id}/variant-analysis` | 对已保存记录施加一组单碱基替换并重跑酶切，返回切口与片段长度差异（不落库，记录不存在返回 404） |
 | `POST` | `/digests/{id}/enzyme-panel-plan` | 枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读不落库，记录不存在返回 404，无解返回 422） |
+| `POST` | `/digests/{id}/partial-digest-distribution` | 为每个已保存切口指定独立切割概率，枚举切/不切组合并按片段长度多重集合并概率分布（只读不落库，记录不存在返回 404，坐标不匹配或切口超过 12 个返回 422） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交示例
@@ -257,6 +258,66 @@ curl -X POST http://localhost:8000/digests/1/enzyme-panel-plan \
 | `candidates` 为空或超过 8 种 | **422** |
 | 候选酶非法（非 IUPAC 模式 / 切口偏移越界） | **422** |
 
+## 部分酶切概率分布
+
+部分酶切（partial digest）模拟：为已保存记录中的**每个物理切口**指定
+`0 ~ 1` 的独立切割概率，枚举全部"切开/未切开"组合（**至多 12 个切口**，
+即 4096 种），复用线性/环形片段重建逻辑计算每种组合的片段长度多重集；
+多重集相同的结果**合并并累加概率**，按概率降序返回完整分布。
+**分析过程不写库**：原记录保持不变，也不会产生新的提交。
+
+服务启动后访问地址为 **http://localhost:8000**，交互式文档见
+**http://localhost:8000/docs**（其中可在线试调本接口）。
+
+### 请求
+
+以下示例假设 `id=1` 的记录为线性序列 `AAAAGAATTCTTTT`、含一个 EcoRI
+切口 `(top_cut=5, bottom_cut=9)`（可先通过 `POST /digests` 创建）：
+
+```bash
+curl -X POST http://localhost:8000/digests/1/partial-digest-distribution \
+  -H 'Content-Type: application/json' \
+  -d '{"cuts": [{"top_cut": 5, "bottom_cut": 9, "probability": 0.75}]}'
+```
+
+- `cuts`：为**每个**已保存物理切口指定概率，切口以物理坐标
+  `(top_cut, bottom_cut)` 标识（与 `GET /digests/{id}` 返回的切口一一对应，
+  传入顺序不限），`probability` 取值 `0 ~ 1`。
+- 坐标集合必须与已保存切口**完全一致**：缺失、多余或重复均返回 422。
+
+### 响应
+
+```json
+{
+  "id": 1,
+  "topology": "linear",
+  "cut_count": 1,
+  "outcome_count": 2,
+  "total_probability": 1.0,
+  "outcomes": [
+    {"fragment_lengths": [5, 9], "fragment_count": 2, "probability": 0.75},
+    {"fragment_lengths": [14], "fragment_count": 1, "probability": 0.25}
+  ]
+}
+```
+
+- `outcomes`：合并后的分布，按 `probability` **降序**排列（概率相同按片段
+  长度多重集升序，输出完全确定）；`fragment_lengths` 为升序的片段长度多重集。
+- **合并口径**：只要片段长度多重集相同即合并——例如线性分子上只切 5 位得
+  `[5, 9]` 与只切 9 位得 `[9, 5]`；环形分子 0 个与 1 个切口均为全长片段。
+- `total_probability`：全部结果概率之和，与 1 的误差不超过 `1e-9`；
+  概率为 0 的组合（某切口概率取 0 或 1 时）不列入分布。
+
+### 校验与状态码
+
+| 情形 | 状态码 |
+| --- | --- |
+| 记录不存在 | **404** |
+| 已保存切口超过 12 个（枚举上限） | **422** |
+| 坐标缺失 / 多余（与已保存切口不一致） | **422** |
+| 坐标重复 | **422** |
+| `probability` 超出 `[0, 1]` | **422** |
+
 ## 结果字段约定
 
 - **坐标**：均为 0-based，作用于 top 链（提交序列方向）；切口位置 `c` 表示断裂
@@ -295,6 +356,7 @@ app/
 ├── digest.py    # 酶切核心算法（搜索、去重、片段生成）
 ├── variant.py   # 变异施加与切口/片段差异对比
 ├── panel.py     # 酶组合面板规划（枚举候选组合、最少酶择优）
+├── partial.py   # 部分酶切概率分布（枚举切/不切组合、按长度多重集合并）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
 └── db.py        # SQLite 持久化（启动时自动建表）
@@ -302,7 +364,8 @@ tests/
 ├── test_digest.py       # 酶切算法测试
 ├── test_api.py          # 提交/查询/校验 API 测试
 ├── test_variant_api.py  # 变异影响分析 API 测试
-└── test_panel_api.py    # 酶组合面板规划 API 测试
+├── test_panel_api.py    # 酶组合面板规划 API 测试
+└── test_partial_api.py  # 部分酶切概率分布 API 测试
 Dockerfile
 docker-compose.yml
 requirements.txt

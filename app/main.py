@@ -6,6 +6,9 @@
     GET  /digests/{id}                     按 id 查询保存的完整酶切结果
     POST /digests/{id}/variant-analysis    基于已保存记录施加单碱基替换，重跑酶切并对比差异（不落库）
     POST /digests/{id}/enzyme-panel-plan   枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读，不落库）
+    POST /digests/{id}/partial-digest-distribution
+                                           为每个已保存切口指定独立切割概率，枚举切/不切组合，
+                                           按片段长度多重集合并概率分布（只读，不落库）
     GET  /health                           健康检查
 """
 
@@ -19,6 +22,11 @@ from fastapi import FastAPI, HTTPException
 from .db import Database
 from .digest import run_digest
 from .panel import plan_enzyme_panel
+from .partial import (
+    MAX_PARTIAL_CUTS,
+    align_cut_probabilities,
+    partial_digest_distribution,
+)
 from .schemas import (
     DigestRequest,
     DigestResponse,
@@ -26,6 +34,8 @@ from .schemas import (
     EnzymeIn,
     EnzymePanelPlanRequest,
     EnzymePanelPlanResponse,
+    PartialDigestRequest,
+    PartialDigestDistributionResponse,
     VariantAnalysisRequest,
     VariantAnalysisResponse,
 )
@@ -175,4 +185,44 @@ def plan_panel(submission_id: int, request: EnzymePanelPlanRequest) -> dict:
         "selected_enzymes": [e.model_dump() for e in plan["enzymes"]],
         "fragment_count": plan["fragment_count"],
         "cuts": plan["cuts"],
+    }
+
+
+@app.post(
+    "/digests/{submission_id}/partial-digest-distribution",
+    response_model=PartialDigestDistributionResponse,
+)
+def partial_digest(submission_id: int, request: PartialDigestRequest) -> dict:
+    # 先确认记录存在：不存在返回 404，且不泄露任何校验细节
+    record = db.get_submission(submission_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"submission {submission_id} not found")
+
+    # 枚举规模为 2^n，切口数超过上限时无法保证响应时间 -> 422
+    cuts = record["result"]["cuts"]
+    if len(cuts) > MAX_PARTIAL_CUTS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"record has {len(cuts)} physical cuts, which exceeds the "
+                f"partial digest enumeration limit of {MAX_PARTIAL_CUTS}"
+            ),
+        )
+
+    # 坐标集合必须与已保存切口完全一致（缺失/多余/重复均拒绝）
+    probabilities, error = align_cut_probabilities(cuts, request.cuts)
+    if error is not None:
+        raise HTTPException(status_code=422, detail=error)
+
+    # 仅在内存中枚举组合并复用片段重建逻辑，原记录与数据库均不改动
+    distribution = partial_digest_distribution(
+        record["sequence"], record["topology"], cuts, probabilities
+    )
+    return {
+        "id": record["id"],
+        "topology": record["topology"],
+        "cut_count": len(cuts),
+        "outcome_count": len(distribution["outcomes"]),
+        "total_probability": distribution["total_probability"],
+        "outcomes": distribution["outcomes"],
     }

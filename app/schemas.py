@@ -246,3 +246,47 @@ class EnzymePanelPlanResponse(BaseModel):
     fragment_count: int
     cuts: list[CutOut]
 
+
+# ---------- 部分酶切概率分布 ----------
+
+
+class CutProbabilityIn(BaseModel):
+    """一个已保存物理切口的独立切割概率。
+
+    以物理坐标 (top_cut, bottom_cut) 标识切口（与已保存记录中的切口
+    一一对应）；probability 取值 [0, 1]，且不允许 NaN/无穷。
+    """
+
+    top_cut: int = Field(ge=0, examples=[5])
+    bottom_cut: int = Field(ge=0, examples=[9])
+    probability: float = Field(ge=0.0, le=1.0, allow_inf_nan=False, examples=[0.8])
+
+
+class PartialDigestRequest(BaseModel):
+    """部分酶切分布请求：为记录中的每个物理切口指定独立切割概率。
+
+    坐标集合必须与已保存记录的物理切口完全一致；缺失、多余或重复的
+    坐标依赖已保存记录，在路由中取到记录之后以 422 拒绝。
+    """
+
+    cuts: list[CutProbabilityIn] = Field(default_factory=list)
+
+
+class PartialDigestOutcomeOut(BaseModel):
+    """一个合并后的结果：片段长度多重集（升序）及其累计概率。"""
+
+    fragment_lengths: list[int]
+    fragment_count: int
+    probability: float
+
+
+class PartialDigestDistributionResponse(BaseModel):
+    """部分酶切分布：全部合并结果按概率降序排列，概率总和为 1（误差 < 1e-9）。"""
+
+    id: int
+    topology: Literal["linear", "circular"]
+    cut_count: int
+    outcome_count: int
+    total_probability: float
+    outcomes: list[PartialDigestOutcomeOut]
+
